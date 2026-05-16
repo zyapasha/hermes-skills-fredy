@@ -5,6 +5,8 @@ description: Before minting an ERC721 to an EOA on a Pectra-active chain (Ethere
 
 # EIP-7702 + ERC721 _safeMint compatibility check
 
+🌐 **English** · [Bahasa Indonesia](SKILL.id.md)
+
 ## When to use this skill
 
 Run this check BEFORE any NFT mint where:

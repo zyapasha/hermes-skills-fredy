@@ -11,6 +11,8 @@ metadata:
 
 # mint-executor
 
+🌐 **English** · [Bahasa Indonesia](SKILL.id.md)
+
 ## When to use
 
 User wants to mint an NFT/token across multiple agent wallets fast. Triggers:
