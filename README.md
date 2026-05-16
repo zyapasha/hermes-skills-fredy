@@ -1,8 +1,27 @@
 # hermes-skills-fredy
 
+🌐 **English** · [Bahasa Indonesia](README.id.md)
+
 > A collection of [Hermes Agent](https://hermes-agent.nousresearch.com) skills extracted from production use of FREDY, an autonomous Web3 + dev-ops agent.
 
 These skills encode hard-won procedural knowledge from running an agent that mints NFTs, monitors Telegram for alpha, and executes on-chain transactions in production. Each skill is a single `SKILL.md` file with YAML frontmatter, ready to drop into your `~/.hermes/skills/` directory.
+
+## For beginners: what is this for?
+
+[Hermes Agent](https://hermes-agent.nousresearch.com) is an open-source autonomous agent framework. You configure it, give it tools (terminal, browser, web search, etc.), connect it to a chat platform (Telegram, Discord, Matrix), and it operates as a long-running assistant.
+
+A "skill" is a markdown file the agent reads when a relevant task comes up. Think of it as a recipe: trigger conditions, step-by-step procedure, pitfalls to avoid. The agent loads the right skill automatically based on what you asked for.
+
+This repo bundles 4 skills that took ~2 weeks of production failures to refine. Drop them into your Hermes setup and your agent inherits the lessons learned.
+
+**Who is this for?**
+- Anyone running a Hermes Agent (or compatible framework) for Web3 ops
+- Builders curious about how skill-based agent design works in practice
+- Operators who want a tested baseline rather than rolling their own
+
+**What you need:**
+- A working [Hermes Agent](https://hermes-agent.nousresearch.com) install (or just read the skills as documentation)
+- Linux / macOS / WSL terminal
 
 ## What's included
 
