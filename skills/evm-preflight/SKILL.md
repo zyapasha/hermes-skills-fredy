@@ -133,6 +133,23 @@ curl -s $RPC -X POST -H "content-type: application/json" \
 
 If 7702 and ga handle ERC721: revoke first (see `revoke-7702` step below) atau pake wallet EOA bersih lain.
 
+### 1b. `_mint` vs `_safeMint` grep — fast 7702-safety determination
+
+Once you have verified source from Sourcify, a single grep tells you whether the contract is 7702-vulnerable BEFORE you bother running the wallet-side EOA check:
+
+```bash
+grep -E '\b_safeMint\b|\b_mint\b' /tmp/<contract>.sol | head -10
+```
+
+Interpretation:
+- Only `_mint(...)` appears → contract uses raw mint, no `onERC721Received` callback. **EIP-7702 delegated wallets are SAFE** even if `eth_getCode` shows `0xef0100...` delegate code. Skip the revoke step.
+- `_safeMint(...)` appears anywhere in the mint path → callback fires on receiver. EIP-7702 wallets MUST be `eth_getCode == 0x` or revoked first.
+- Both appear → trace which one the user-callable mint function actually calls. The public mint may use `_mint` while admin reserve uses `_safeMint` (or vice versa).
+
+Empirical (2026-05-16 OEGP `0x460d7DFa7AefB52dDb7B87a767485325B31272d9`): `freePlanting()` calls `_mintPlant()` → `_mint()` (raw, no callback). 7702-delegated wallets would mint successfully here. Saved a revoke tx that would have been unnecessary.
+
+This is a 5-second check that gates whether the rest of the 7702 workflow is needed. Run it before deciding to revoke.
+
 ### 2. Verify contract ABI + revert errors
 
 Pull verified source from Sourcify (works without API key, redirects properly with `-L`):
@@ -227,7 +244,154 @@ eth_account 0.13+ also supports `Account.sign_authorization(...)` for Python bui
 
 ## Pitfalls
 
-- **Don't trust dry-run cost as final**. EIP-1559 gas can spike between dry-run and broadcast. Cek lagi `eth_gasPrice` sebelum sign final tx.
+## Flashbots Protect for free / zero-gas-risk mints
+
+When you want to attempt a mint that MIGHT revert (per-block cap contention, dynamic supply check, signature single-use race) without burning gas on the revert, use Flashbots Protect RPC. The key property: **if your tx would revert in simulation, Flashbots drops it from the queue instead of including it. Zero gas paid.**
+
+```
+RPC: https://rpc.flashbots.net?hint=hash
+```
+
+Trade-off: tx may not land at all (if it would always revert during the protect window, it expires after ~25 blocks / ~5 minutes). For a contested free mint where you'd otherwise burn 0.0005-0.001 ETH per failed attempt, this is the right trade.
+
+### ethers v6 Contract.method() trap
+
+`Contract.method(...)` calls in ethers v6 invoke `estimateGas` against the connected provider BEFORE submitting. When the connected provider is Flashbots Protect, estimation runs against the public mempool simulation which sees the contract in its just-failed state → throws `could not coalesce error` and the tx never reaches Flashbots:
+
+```js
+// ❌ BROKEN — fails with "could not coalesce error" on contested mints
+const c = new Contract(addr, abi, walletConnectedToFlashbots);
+const tx = await c.freePlanting({gasLimit: 250000n, ...});
+```
+
+Bypass: build calldata yourself, send via `wallet.sendTransaction({to, data, ...})`. This skips the local estimate-then-send pattern and submits the raw tx directly to Flashbots, which does its own simulation:
+
+```js
+const iface = new Interface(["function freePlanting() returns (uint256)"]);
+const calldata = iface.encodeFunctionData("freePlanting", []);
+
+const tx = await wallet.sendTransaction({
+  to: CONTRACT,
+  data: calldata,
+  gasLimit: 250000n,                    // hardcode, don't estimate
+  maxFeePerGas: ...,
+  maxPriorityFeePerGas: ...,
+  nonce,                                // explicit nonce
+});
+```
+
+Empirical (2026-05-16 OEGP): with `Contract.method()` connected to Flashbots, 10/10 attempts threw `could not coalesce error` locally and never submitted. After switching to `wallet.sendTransaction({data})`, 8/8 attempts submitted cleanly to Flashbots and all dropped (revert protection worked as designed). Same nonce reused across attempts because Flashbots dropped each one before mining — no nonce-bump needed.
+
+### Read-provider for queries, Flashbots-provider for sends
+
+Flashbots RPC is sender-only — don't use it for `eth_call` / `getBlock` / `getBalance` queries. Set up two providers:
+
+```js
+const readP = new JsonRpcProvider("https://ethereum-rpc.publicnode.com");
+const fbP = new JsonRpcProvider("https://rpc.flashbots.net?hint=hash");
+const wallet = new Wallet(pk, fbP);                    // signs + submits via FB
+const c = new Contract(addr, abi, readP);              // queries via public RPC
+```
+
+`wallet.sendTransaction(...)` uses the wallet's provider (Flashbots). Reads via `c.method()` use the contract's provider (public RPC, fast). This is the correct two-provider split.
+
+### Loop pattern: short poll, drop-and-retry
+
+Flashbots' default 25-block (~5min) drop window is too long for contested drops. Poll for inclusion only 4-6 blocks (~50-75s), then declare "dropped — 0 gas, retry". Same nonce works because Flashbots already evicted the prior attempt:
+
+```js
+for (let p = 0; p < 4; p++) {
+  await sleep(12000);
+  const rcpt = await readP.getTransactionReceipt(txHash).catch(() => null);
+  if (rcpt) {
+    if (rcpt.status === 1) { /* MINTED */ return; }
+    else { /* landed-but-reverted, rare under FB */ break; }
+  }
+}
+// Not landed in 4 blocks → Flashbots dropped, retry with same nonce
+```
+
+When `pendingNonce == latestNonce` mid-loop, no tx in mempool — confirms FB drop, free to resubmit.
+
+Reference implementation: `scripts/flashbots-protect-mint.js` — full loop with two-provider setup, direct-calldata send, short-poll retry, nonce reuse. Ready to adapt for any nullary `mint*` function.
+
+### When NOT to use Flashbots Protect
+
+- **Whitelisted / signature-required mints** — your sig is valid only for the specific tx params (price, recipient). If FB drops + you retry with a slightly different nonce/tip, signature still binds correctly, fine. But if your sig has a deadline or single-use binding, FB's 5min retention may push you past it.
+- **Mints where revert IS the intended path** — if you actually want the revert (e.g. probing whether a state changed), FB hides that signal from you. Use public RPC.
+- **Contests where slot-position matters more than revert avoidance** — FB optimizes for revert protection, not first-mover slot. If you need pos 0 in a block, FB's auction inclusion is too slow; you need direct builder integration.
+
+## Per-block mint caps are STRUCTURAL LOSE for public-mempool users
+
+When the contract has `FREE_PLANTING_PER_BLOCK_CAP = N` (or similar small `N`, ~10-20), and the drop is contested, **public mempool tx will lose every block**. Bot operators with private mempool / direct builder access fill the N slots in tx-position 0..N-1; your tx lands at position N+ and reverts with the cap-exceeded custom error.
+
+Empirical (2026-05-16 OEGP `0x460d7DFa7AefB52dDb7B87a767485325B31272d9`, cap=18):
+- Polling hunter (12s/loop, 800ms inner): 60 attempts × 6 blocks all 18/18 cap full → 0 mint, 0 gas
+- Fire-blind from public RPC with 5g tip: 5 tx all landed at pos 92-186 in their blocks (NOT pos 0-17), all reverted `BlockMintLimitExceeded()`, burned 0.000522 ETH
+- Flashbots Protect with 5g tip: 8 tx all DROPPED (Flashbots simulated, saw revert, didn't include) → 0 ETH burned. Drop wasn't a bug; that's the protection working as designed when bots already filled the block
+
+**Rule**: if the contract has a per-block cap AND the drop is in active contention (sisa supply / total mint rate suggests more than ~30 min remaining), don't try to mint from public mempool. Either:
+1. Use Flashbots Protect — accept that drops happen (0 gas waste, but probably 0 mint too)
+2. Wait until tail-end when bots have hit per-wallet cap and competition thins
+3. Skip the drop
+
+Don't burn 0.001+ ETH on fire-blind retries hoping tip-bidding nudges you into pos 0-17. Bot priority fees on contested mints routinely run 50-200g. You can't outbid them on a 0.002 ETH wallet.
+
+### Tail-end is also infeasible when `sisa / cap < ~10 blocks`
+
+Common reflex: \"sisa supply is low, bots already done, last-call easy.\" Wrong for cap-gated drops. Math: with `FREE_PLANTING_PER_BLOCK_CAP = 18` and `sisa = 81`, you have ~5 blocks of supply left (~60s). In that window, every block is still 18/18 because the same private-builder bots that filled b1..bN are also racing the final 5 blocks. Empirical (2026-05-16 OEGP, second pass at supply 621 → 81 → 0): 8 Flashbots Protect attempts spanning sisa 621 down to sisa 81, ALL dropped (revert sim showed cap full every block). Final state 8879/8879 sold out within ~10 blocks of the last attempt window.
+
+**Decision rule**: if `sisa / per_block_cap < 10` AND you didn't land in the first 2-3 attempts, stop. Race intensifies as supply tightens because bots that haven't hit per-wallet cap fire harder. The 5-min Flashbots Protect retention buys you nothing when every block continues to fill 18/18.
+
+### Public mempool is structurally wrong for cap-gated drops
+
+You will never out-bid the bot pool on tip from a 0.002 ETH wallet. Bot operators run with direct builder integrations (Titan, Beaver, Rsync, BloXroute) and submit bundles at 50-200 gwei priority fee + private mempool. Their tx lands at position 0-17 in the block; your public-mempool tx lands at position 100+ and reverts on the cap-check modifier. Empirical: 5 fire-blind tx with tip 5g landed at positions 92, 98, 110, 167, 186 — all consumed gas in the cap-check modifier (~38k gas/revert) before reverting `BlockMintLimitExceeded()`. Total burn: 0.000522 ETH for 0 NFT.
+
+This is not a tip-bidding problem you can solve by going to 20g or 50g. It's a mempool-access problem. Either you have private builder lanes (you don't), or you accept Flashbots Protect's drop-on-revert behavior (0 gas, probably 0 mint too).
+
+
+### Per-block mint caps are anti-bot, not paused-state
+
+Some contracts implement a hard per-block cap on the mint function (e.g. OEGP `FREE_PLANTING_PER_BLOCK_CAP = 18`). The state variable looks like:
+
+```solidity
+uint16 public freePlantedInBlock;
+uint256 public freePlantingBlockNumber;
+// modifier _consumeFreePlantingBlockQuota():
+//   if (block.number != freePlantingBlockNumber) { reset counter; }
+//   require(freePlantedInBlock < FREE_PLANTING_PER_BLOCK_CAP);
+//   freePlantedInBlock++;
+```
+
+Detection — read the packed slot directly when ABI doesn't expose the counter:
+
+```javascript
+// Slot 23 offset 0, uint16 packed. Inspect via storage layout in Sourcify Storage Layout section
+const slotData = await provider.getStorage(contract, 23);
+const planted = parseInt(slotData.slice(-4), 16);  // last 2 bytes of the slot
+const cap = await contract.FREE_PLANTING_PER_BLOCK_CAP();
+const currentBlock = await contract.freePlantingBlockNumber();
+```
+
+Interpretation:
+- `currentBlock < latest.number` → counter will reset on next mint, slot is open
+- `currentBlock == latest.number && planted >= cap` → tx in THIS block reverts; mining 1+ block later is fine
+- `currentBlock == latest.number && planted < cap` → space available, race the remaining slots
+
+Don't conflate this with `paused` state. The block-cap modifier reverts with a custom error (`BlockQuotaReached` or similar) inside the modifier, not from a `whenNotPaused` check. `mintingEnabled` returns true but the call still reverts.
+
+In normal sequential broadcast, this doesn't matter — the next block resets the counter and the tx confirms. It only bites when:
+- Multiple wallets in your fleet target the SAME block (bot races, batch broadcasts)
+- A contract drop just opened and the first block is contested
+
+Pre-flight should surface this as informational, not a blocker, unless you're doing parallel multi-wallet broadcast in a contested block. Then stagger sends across blocks.
+
+### Don't trust dry-run cost as final
+
+- EIP-1559 gas can spike between dry-run and broadcast. Cek lagi `eth_gasPrice` sebelum sign final tx.
+
+### Other pitfalls
+
 - **`estimateGas` failure ≠ tx will fail**. Some RPCs (Ankr free tier) require API key; failure is RPC-level, not contract-level. Fallback to a generous gasLimit (180k for ERC721 mint+sigverify is plenty).
 - **Don't quote API selectors from memory.** Always recompute `keccak(text="...")[:4]` — typos in error names give wrong matches. **System python rarely has `eth_utils` or `pycryptodome`.** If `from eth_utils import keccak` fails, fall back in this order:
   1. **Project venv that already has it** — Hermes ships with telegram-monitor and hermes-agent venvs. Check both:
